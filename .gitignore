@@ -1,0 +1,7 @@
+.env
+*.pdf
+equations/
+__pycache__/
+*.pyc
+.env.example
+
