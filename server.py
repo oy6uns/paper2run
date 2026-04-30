@@ -11,7 +11,6 @@ from typing import Literal
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from openai import OpenAI
@@ -26,10 +25,9 @@ from extract_equations import (
 from extract_figures import (
     detect_figures_on_page,
     crop_bbox,
-    save_crop,
+    upload_figure_to_storage,
     save_to_supabase as save_figures_to_supabase,
     get_or_create_paper_id,
-    CROP_DIR,
 )
 
 # ── 설정 ──────────────────────────────────────────────
@@ -46,10 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# figure 크롭 이미지 정적 서빙 (/crops/paper_stem/fig_id/_figure.jpg)
-CROP_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/crops", StaticFiles(directory=str(CROP_DIR)), name="crops")
 
 # 처리 상태 인메모리 저장 (job_id → status)
 # 프로덕션에서는 Supabase jobs 테이블로 교체
@@ -127,9 +121,7 @@ def run_figure_extraction(job_id: str, tmp_path: str, filename: str):
             for fig in figures:
                 fig_id = fig.get("figure_id", f"fig_p{page_num}")
                 fig_img = crop_bbox(page_img, fig["page_bbox"])
-                fig_crop_path = CROP_DIR / paper_stem / fig_id / "_figure.jpg"
-                save_crop(fig_img, fig_crop_path)
-                fig["image_url"] = f"/crops/{paper_stem}/{fig_id}/_figure.jpg"
+                fig["image_url"] = upload_figure_to_storage(sb, fig_img, paper_stem, fig_id)
                 all_figures.append(fig)
 
         paper_id = get_or_create_paper_id(sb, filename)
@@ -297,7 +289,7 @@ async def extract_figures_endpoint(
     """
     PDF를 업로드하면 figure를 추출합니다.
     - figure bbox 감지 → figure 크롭 저장
-    - 크롭 이미지는 /crops/{paper}/{fig_id}/_figure.jpg 로 서빙됩니다.
+    - 크롭된 figure 이미지는 Supabase Storage에 업로드되며 image_url로 접근 가능합니다.
     """
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")

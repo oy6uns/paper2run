@@ -21,10 +21,10 @@ OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET = os.getenv("SUPABASE_SECRET_KEY")
 
-MODEL     = "gpt-5.4-mini"
-DPI       = 200    # 높을수록 bbox 크롭 정밀도 ↑
-MAX_PAGES = None
-CROP_DIR  = Path(__file__).parent / "figures" / "crops"
+MODEL          = "gpt-5.4-mini"
+DPI            = 200
+MAX_PAGES      = None
+STORAGE_BUCKET = "figures"
 # ─────────────────────────────────────────────────────
 
 # ── Stage 1: 페이지에서 메인 파이프라인 figure 감지 ──
@@ -127,9 +127,16 @@ def crop_bbox(img: Image.Image, bbox: list[float]) -> Image.Image:
     return img.crop((x0, y0, x1, y1))
 
 
-def save_crop(img: Image.Image, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(str(path), format="JPEG", quality=90)
+def upload_figure_to_storage(sb: Client, img: Image.Image, paper_stem: str, fig_id: str) -> str:
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    path = f"{paper_stem}/{fig_id}.jpg"
+    sb.storage.from_(STORAGE_BUCKET).upload(
+        path=path,
+        file=buf.getvalue(),
+        file_options={"content-type": "image/jpeg", "upsert": "true"},
+    )
+    return sb.storage.from_(STORAGE_BUCKET).get_public_url(path)
 
 
 def call_vision(client: OpenAI, system: str, img: Image.Image, user_text: str) -> dict:
@@ -238,12 +245,9 @@ def process_pdf(pdf_path: Path, client: OpenAI, sb: Client) -> None:
             fig["figure_id"] = fig_id
 
             fig_img = crop_bbox(page_img, fig["crop_bbox"])
+            fig["image_url"] = upload_figure_to_storage(sb, fig_img, paper_stem, fig_id)
 
-            fig_crop_path = CROP_DIR / paper_stem / fig_id / "_figure.jpg"
-            save_crop(fig_img, fig_crop_path)
-            fig["image_url"] = f"/crops/{paper_stem}/{fig_id}/_figure.jpg"
-
-            print(f"  [{fig_id}] figure 저장 완료")
+            print(f"  [{fig_id}] Storage 업로드 완료: {fig['image_url']}")
             all_figures.append(fig)
 
     print(f"\n  → 총 {len(all_figures)}개 figure, Supabase 저장 중...")
