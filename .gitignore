@@ -1,6 +1,8 @@
 .env
 *.pdf
 equations/
+figures/
+.claude/
 __pycache__/
 *.pyc
 .env.example
