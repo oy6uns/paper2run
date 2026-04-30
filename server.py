@@ -11,6 +11,7 @@ from typing import Literal
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from openai import OpenAI
@@ -22,6 +23,14 @@ from extract_equations import (
     filter_core_equations,
     save_to_supabase,
 )
+from extract_figures import (
+    detect_figures_on_page,
+    crop_bbox,
+    save_crop,
+    save_to_supabase as save_figures_to_supabase,
+    get_or_create_paper_id,
+    CROP_DIR,
+)
 
 # ── 설정 ──────────────────────────────────────────────
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
@@ -29,14 +38,18 @@ SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET = os.getenv("SUPABASE_SECRET_KEY")
 # ─────────────────────────────────────────────────────
 
-app = FastAPI(title="P4DS Equation Extractor API", version="1.0.0")
+app = FastAPI(title="P4DS Equation & Figure Extractor API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 프로덕션에서는 프론트 도메인으로 제한
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# figure 크롭 이미지 정적 서빙 (/crops/paper_stem/fig_id/_figure.jpg)
+CROP_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/crops", StaticFiles(directory=str(CROP_DIR)), name="crops")
 
 # 처리 상태 인메모리 저장 (job_id → status)
 # 프로덕션에서는 Supabase jobs 테이블로 교체
@@ -76,6 +89,20 @@ class PaperOut(BaseModel):
     created_at: str
 
 
+class FigureOut(BaseModel):
+    id: str
+    paper_id: str
+    fig_number: int | None
+    figure_id: str | None
+    page: int | None
+    caption: str | None
+    figure_type: str | None
+    page_bbox: list[float]
+    image_url: str | None
+    key_insight: str | None
+    created_at: str
+
+
 # ── 캐시 확인 헬퍼 ────────────────────────────────────
 def find_cached_paper(sb: Client, filename: str) -> dict | None:
     """같은 파일명의 논문이 이미 DB에 있으면 반환, 없으면 None"""
@@ -83,7 +110,45 @@ def find_cached_paper(sb: Client, filename: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
-# ── 백그라운드 작업 ───────────────────────────────────
+# ── Figure 백그라운드 작업 ─────────────────────────────
+def run_figure_extraction(job_id: str, tmp_path: str, filename: str):
+    try:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        sb = create_client(SUPABASE_URL, SUPABASE_SECRET)
+        pdf_path = Path(tmp_path)
+        paper_stem = Path(filename).stem
+
+        from extract_figures import pdf_to_images as fig_pdf_to_images
+        pages = fig_pdf_to_images(pdf_path)
+
+        all_figures = []
+        for page_num, page_img in pages:
+            figures = detect_figures_on_page(openai_client, page_num, page_img)
+            for fig in figures:
+                fig_id = fig.get("figure_id", f"fig_p{page_num}")
+                fig_img = crop_bbox(page_img, fig["page_bbox"])
+                fig_crop_path = CROP_DIR / paper_stem / fig_id / "_figure.jpg"
+                save_crop(fig_img, fig_crop_path)
+                fig["image_url"] = f"/crops/{paper_stem}/{fig_id}/_figure.jpg"
+                all_figures.append(fig)
+
+        paper_id = get_or_create_paper_id(sb, filename)
+        save_figures_to_supabase(sb, paper_id, all_figures)
+
+        job_store[job_id] = {
+            "status": "done",
+            "paper_id": paper_id,
+            "filename": filename,
+            "total_figures": len(all_figures),
+            "cached": False,
+        }
+    except Exception as e:
+        job_store[job_id] = {"status": "error", "error": str(e)}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# ── Equation 백그라운드 작업 ──────────────────────────
 def run_extraction(job_id: str, tmp_path: str, filename: str):
     try:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -210,6 +275,69 @@ def get_equations(
         query = query.eq("role", role)
     result = query.execute()
     return result.data
+
+
+# ── Figure 엔드포인트 ─────────────────────────────────
+class FigureJobStatus(BaseModel):
+    job_id: str
+    status: str
+    cached: bool = False
+    paper_id: str | None = None
+    filename: str | None = None
+    total_figures: int | None = None
+    error: str | None = None
+
+
+@app.post("/papers/figures/extract", response_model=FigureJobStatus, status_code=202)
+async def extract_figures_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    force: bool = Query(False),
+):
+    """
+    PDF를 업로드하면 figure를 추출합니다.
+    - figure bbox 감지 → figure 크롭 저장
+    - 크롭 이미지는 /crops/{paper}/{fig_id}/_figure.jpg 로 서빙됩니다.
+    """
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+
+    sb = create_client(SUPABASE_URL, SUPABASE_SECRET)
+
+    if not force:
+        result = sb.table("figures").select("paper_id").eq(
+            "paper_id",
+            sb.table("papers").select("id").eq("filename", file.filename).execute().data[0]["id"]
+            if sb.table("papers").select("id").eq("filename", file.filename).execute().data
+            else "none"
+        ).limit(1).execute()
+        if result.data:
+            paper = sb.table("papers").select("*").eq("filename", file.filename).execute().data[0]
+            fig_count = len(sb.table("figures").select("id").eq("paper_id", paper["id"]).execute().data)
+            job_id = str(uuid.uuid4())
+            job_store[job_id] = {"status": "done", "cached": True,
+                                 "paper_id": paper["id"], "filename": file.filename,
+                                 "total_figures": fig_count}
+            return FigureJobStatus(job_id=job_id, **job_store[job_id])
+
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    job_id = str(uuid.uuid4())
+    job_store[job_id] = {"status": "processing", "filename": file.filename, "cached": False}
+    background_tasks.add_task(run_figure_extraction, job_id, tmp_path, file.filename)
+    return FigureJobStatus(job_id=job_id, status="processing", filename=file.filename)
+
+
+@app.get("/papers/{paper_id}/figures", response_model=list[FigureOut])
+def list_figures(paper_id: str):
+    """논문의 figure 목록 (page 순)"""
+    sb = create_client(SUPABASE_URL, SUPABASE_SECRET)
+    result = sb.table("figures").select("*").eq("paper_id", paper_id).order("fig_number").execute()
+    return result.data
+
 
 
 @app.get("/health")
